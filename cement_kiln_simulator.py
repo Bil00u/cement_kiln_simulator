@@ -1,146 +1,158 @@
 import streamlit as st
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
-from mpl_toolkits.mplot3d import Axes3D
-from scipy.integrate import odeint
-import matplotlib.colors as mcolors
+import time
 
-# Constants
-fuel_heat_value = 32000  # kJ/kg
-specific_heat = 1.0      # kJ/kg·°C
-heat_loss_coeff = 0.001  # proportional heat loss factor
-ambient_temp = 30        # °C
-co2_per_kg_fuel = 3.17   # kg CO2/kg coal
+# --- Page Configuration ---
+st.set_page_config(page_title="Cement Production Simulator", layout="wide")
 
-# Kiln physical parameters
-kiln_radius = 3.0        # meters
-kiln_length = 40.0       # meters
-kiln_volume = np.pi * kiln_radius**2 * kiln_length  # m^3
-kiln_mass = kiln_volume * 1200  # Assume clinker density = 1200 kg/m^3
+# --- Top Controls ---
+ctrl_cols = st.columns([1,1,1,1,1,1])
+start_btn = ctrl_cols[0].button("▶️ Start")
+stop_btn = ctrl_cols[1].button("⏹ Stop")
+reset_btn = ctrl_cols[2].button("🔄 Reset")
+mode = ctrl_cols[3].selectbox("Mode", ["Automatic", "Manual"])
+radius = ctrl_cols[4].slider("Radius (m)", 3.0, 6.0, 5.0, 0.5)
+length = ctrl_cols[5].slider("Length (m)", 40.0, 100.0, 80.0, 5.0)
 
-# Streamlit UI
-st.title("Cement Kiln Simulation with 3D Visualization")
-st.sidebar.header("Input Parameters")
+# --- Header ---
+st.title("🏭 Cement Production Simulator Kiln & The Smart Factory 🏭")
+st.subheader("👷 Bilal El Barbir & Faisal Adam Reda 👷")
 
-# Sidebar inputs
-fuel_rate = st.sidebar.slider("Fuel Rate (kg/hr)", 100, 1000, 500)
-motor_speed = st.sidebar.slider("Motor Speed (RPM)", 0.5, 5.0, 2.5, 0.1)
-feed_rate = st.sidebar.slider("Feed Rate (kg/hr)", 500, 3000, 1200, 100)
-temp_setpoint = st.sidebar.slider("Temperature Setpoint (°C)", 1000, 1500, 1350, 10)
+# --- Description ---
+with st.expander("📝 Description", expanded=True):
+    st.write(
+        """
+        **Features:**
+        - Rotary kiln with customizable dimensions (radius & length).
+        - Two modes: Automatic (PID) or Manual control.
+        - PID sliders for Kp, Ki, Kd.
+        - Real-time 3D kiln rotation.
+        - Live multi-trend chart: Temperature, Error, Control Signal, CO₂ Emissions.
+        - Metric gauges: Temperature, Quality, CO₂ Emissions/hr.
+        - Start, Stop, Reset buttons.
+        """
+    )
 
-# Derived values
-residence_time = 30 / motor_speed
-efficiency_factor = min(1.0, residence_time / 30)
+# --- Sidebar Parameters ---
+fuel_rate_base = st.sidebar.slider("Base Fuel Rate (kg/hr)", 100, 1500, 600)
+motor_speed = st.sidebar.slider("Motor Speed (RPM)", 0.5, 10.0, 3.0, 0.1)
+feed_rate = st.sidebar.slider("Feed Rate (kg/hr)", 500, 5000, 1500, 100)
+temp_setpoint = st.sidebar.slider("Temp Setpoint (°C)", 800, 1600, 1400, 10)
+Kp = st.sidebar.slider("Kp", 0.0, 20.0, 5.0, 0.1)
+Ki = st.sidebar.slider("Ki", 0.0, 5.0, 0.5, 0.01)
+Kd = st.sidebar.slider("Kd", 0.0, 5.0, 0.1, 0.01)
 
-# PID controller
-def pid_control(error, integral, derivative):
-    return Kp * error + Ki * integral + Kd * derivative
+# --- Initialize Session State ---
+if 'running' not in st.session_state:
+    st.session_state.running = False
+if reset_btn or 't' not in st.session_state:
+    st.session_state.update({
+        't': 0.0,
+        'temps': [],
+        'errors': [],
+        'controls': [],
+        'co2s': [],
+        'times': [],
+        'integral': 0.0,
+        'prev_error': 0.0
+    })
+if start_btn:
+    st.session_state.running = True
+if stop_btn:
+    st.session_state.running = False
 
-# Temperature differential equation
-def kiln_model(T, t, fuel_rate, feed_rate):
-    error = temp_setpoint - T
-    integral = 0
-    derivative = 0
-    control_signal = pid_control(error, integral, derivative)
-    
-    fuel_rate_adjusted = max(100, min(1000, fuel_rate + control_signal))
-    heat_input_kjs = fuel_rate_adjusted * fuel_heat_value / 3600
-    effective_heat_input = heat_input_kjs * efficiency_factor
+# --- Physical Constants ---
+heat_val = 32000       # kJ/kg
+spec = 1.0             # kJ/kg·°C
+loss_coef = 0.001      # heat loss factor
+amb_temp = 30          # °C
+co2_factor = 3.17      # kg CO₂ per kg fuel
+mass = np.pi * radius**2 * length * 1200  # kg
 
-    heat_loss = heat_loss_coeff * (T - ambient_temp)
-    dTdt = (effective_heat_input - heat_loss) / (kiln_mass * specific_heat)
-    
-    return dTdt
+dt = 1.0  # second step
 
-# Time points for simulation (e.g., 1 hour)
-time = np.linspace(0, 3600, 1000)  # simulate for 1 hour (3600 seconds)
-initial_temp = 400  # Starting temperature of the kiln
+# --- Layout Placeholders ---
+viz_col, chart_col = st.columns([1, 2])
+gauge_cols = st.columns(3)
+with viz_col:
+    kiln_vis = st.empty()
+with chart_col:
+    trend_vis = st.empty()
 
-# Solve the differential equation
-temperature = odeint(kiln_model, initial_temp, time, args=(fuel_rate, feed_rate))
+# --- Simulation Loop ---
+while st.session_state.running and st.session_state.t <= 3600:
+    t = st.session_state.t
+    # Current temp
+    T = st.session_state.temps[-1] if st.session_state.temps else amb_temp
 
-# Final temperature after simulation
-final_temp = temperature[-1]
+    # Control calculation
+    if mode == 'Automatic':
+        error = temp_setpoint - T
+        st.session_state.integral += error * dt
+        derivative = (error - st.session_state.prev_error) / dt
+        control = Kp * error + Ki * st.session_state.integral + Kd * derivative
+        st.session_state.prev_error = error
+        fuel_rate = np.clip(fuel_rate_base + control, 100, 1500)
+    else:
+        error = 0.0
+        control = 0.0
+        fuel_rate = fuel_rate_base
 
-# PID control simulation for temperature regulation
-if final_temp >= 1350:
-    quality = "✅ Good Clinker Formation"
-elif final_temp >= 1200:
-    quality = "⚠️ Partial Sintering"
-else:
-    quality = "❌ Poor Quality"
+    # Temperature update
+    heat_in = fuel_rate * heat_val / 3600
+    loss = loss_coef * (T - amb_temp)
+    cooling = feed_rate * spec * (T - amb_temp) / mass
+    dT = (heat_in - loss - cooling) / (mass * spec)
+    T += dT * dt
 
-# CO2 emissions estimation
-co2_emitted = fuel_rate * co2_per_kg_fuel  # kg/hr
+    # CO2 calculation
+    co2 = fuel_rate * co2_factor
 
-# 3D Kiln Visualization
-fig = plt.figure()
-ax = fig.add_subplot(111, projection='3d')
+    # Record data
+    st.session_state.temps.append(T)
+    st.session_state.errors.append(error)
+    st.session_state.controls.append(control)
+    st.session_state.co2s.append(co2)
+    st.session_state.times.append(t/60)
+    st.session_state.t += dt
 
-# Create the rotary kiln
-theta = np.linspace(0, 2 * np.pi, 100)
-z = np.linspace(0, kiln_length, 100)
-X = kiln_radius * np.cos(theta)
-Y = kiln_radius * np.sin(theta)
+    # 3D Kiln Visualization
+    theta = np.linspace(0, 2 * np.pi, 100)
+    z = np.linspace(0, length, 100)
+    angle = motor_speed * 2 * np.pi / 60 * t
+    X = radius * np.cos(theta + angle)
+    Y = radius * np.sin(theta + angle)
+    fig1 = plt.figure(figsize=(4, 3))
+    ax1 = fig1.add_subplot(111, projection='3d')
+    ax1.plot_surface(X, Y, z[:, None], color='gray', alpha=0.7)
+    ax1.axis('off')
+    kiln_vis.pyplot(fig1)
 
-# Plot the kiln body
-ax.plot_surface(X, Y, z[:, None], color='gray', edgecolor='black', alpha=0.7)
+    # Trend Chart DataFrame
+    df = pd.DataFrame({
+        'Temp (°C)': st.session_state.temps,
+        'Error (°C)': st.session_state.errors,
+        'Control (kg/hr)': st.session_state.controls,
+        'CO₂ (kg/hr)': st.session_state.co2s
+    }, index=st.session_state.times)
+    trend_vis.line_chart(df)
+    time.sleep(0.1)
 
-# Fuel simulation: Representing fuel flow into the kiln with color gradient
-fuel_color_map = mcolors.LinearSegmentedColormap.from_list('fuel_colormap', ['orange', 'yellow', 'red'])
-fuel = ax.scatter(X, Y, z, c=z, cmap=fuel_color_map, s=20)
+# --- Final Metrics ---
+final_temp = st.session_state.temps[-1] if st.session_state.temps else amb_temp
+quality = (
+    "✅ Good" if final_temp >= temp_setpoint else
+    "⚠️ Partial" if final_temp >= temp_setpoint - 150 else
+    "❌ Poor"
+)
+final_co2 = st.session_state.co2s[-1] if st.session_state.co2s else 0.0
 
-# Adding fire effect: a simple flame effect at the outlet
-fire_height = 2  # The height at which fire is simulated
-fire = ax.scatter(0, 0, fire_height, c='red', s=100, alpha=0.8, marker='o')
+gauge_cols[0].metric("Temperature", f"{final_temp:.1f} °C", delta=f"{final_temp - temp_setpoint:.1f}")
+gauge_cols[1].metric("Quality", quality)
+gauge_cols[2].metric("CO₂ Emissions/hr", f"{final_co2:.1f} kg")
 
-# Set plot limits and labels
-ax.set_xlim([-kiln_radius - 2, kiln_radius + 2])
-ax.set_ylim([-kiln_radius - 2, kiln_radius + 2])
-ax.set_zlim([0, kiln_length])
-ax.set_xlabel('X-axis (meters)')
-ax.set_ylabel('Y-axis (meters)')
-ax.set_zlabel('Kiln Length (meters)')
-ax.set_title('3D Cement Rotary Kiln Simulation')
-
-# Function to update the animation (spinning kiln and fuel)
-def update(frame):
-    # Rotate the feed material to simulate kiln rotation
-    angle = np.radians(frame)
-    X_rot = kiln_radius * np.cos(theta + angle)
-    Y_rot = kiln_radius * np.sin(theta + angle)
-    
-    # Update the kiln surface and fire effect position
-    ax.cla()  # Clear previous frame
-    ax.plot_surface(X_rot, Y_rot, z[:, None], color='gray', edgecolor='black', alpha=0.7)
-    ax.scatter(X_rot, Y_rot, z, c=z, cmap=fuel_color_map, s=20)
-    ax.scatter(0, 0, fire_height, c='red', s=100, alpha=0.8, marker='o')
-    
-    # Fire simulation (animate the flame movement)
-    ax.scatter(0, 0, fire_height + np.sin(np.radians(frame)) * 0.2, c='orange', s=150, alpha=0.6, marker='o')
-
-# Create the animation
-ani = FuncAnimation(fig, update, frames=np.arange(0, 360, 5), interval=100, blit=False)
-
-# Display the animation in Streamlit
-st.pyplot(fig)
-
-# Results and efficiency estimate
-st.subheader("Results")
-st.write(f"**Final Temperature:** {final_temp:.2f} °C")
-st.write(f"**Estimated Product Quality:** {quality}")
-st.write(f"**CO2 Emissions:** {co2_emitted:.2f} kg/hr")
-
-# Savings Estimate (Example)
-baseline_fuel = 700
-baseline_heat = baseline_fuel * fuel_heat_value / 3600
-baseline_temp = (baseline_heat / (kiln_mass * specific_heat)) + ambient_temp
-savings = (baseline_fuel - fuel_rate) * 330 * 24  # kg/year
-co2_saved = savings * co2_per_kg_fuel
-money_saved = savings * 15  # assuming $15/ton
-
-st.subheader("Efficiency Estimate")
-st.write(f"**Annual Fuel Saved:** {savings:.0f} kg/year")
-st.write(f"**CO2 Reduction:** {co2_saved:.0f} kg/year")
-st.write(f"**Estimated Money Saved:** ${money_saved:.2f} /year")
+# --- Auto-Refresh ---
+if st.session_state.running:
+    st.experimental_rerun()
