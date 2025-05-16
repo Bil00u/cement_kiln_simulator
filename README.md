@@ -29,5 +29,5 @@ streamlit run cement_kiln_simulator.py
 
 
 👨‍💻 Authors
-Bilal El Barbir
+Bilal El Barbir and 
 Faisal Adam Reda
